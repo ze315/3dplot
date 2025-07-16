@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import warnings
 warnings.filterwarnings("ignore")
-%matplotlib tk
+
 
 # A few Constants
 re = 6.378e6  # Earth radius in meters
@@ -170,15 +170,15 @@ for ttt in range(len(tideal) - 1):
                 if aa == 1:
                     fig = plt.figure(22)
                     ax = fig.add_subplot(111)
+                    dbzc = dbZnow
+                    if dbzc.shape != xdist.shape:
+                        print(f"Shape mismatch: dbzc {dbzc.shape}, xdist {xdist.shape}, transposing dbzc")
+                        dbzc = dbzc.T
                     dbzc[dbzc < 5] = np.nan
+                    xc = xdist.copy()
                     yc = ydist.copy()
-                    if dbzc.shape == xdist.shape:
-                        xc = xdist.copy()
-                        xc[np.isnan(dbzc)] = np.nan
-                        yc = ydist.copy()
-                        yc[np.isnan(dbzc)] = np.nan
-                    else:
-                        print(f"Shape mismatch: dbzc {dbzc.shape}, xdist {xdist.shape}")
+                    xc[np.isnan(dbzc)] = np.nan
+                    yc[np.isnan(dbzc)] = np.nan
                     xc_flat = xc.flatten()
                     yc_flat = yc.flatten()
                     dbzc_flat = dbzc.flatten()
