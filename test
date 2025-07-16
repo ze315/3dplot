@@ -1,1 +1,337 @@
+import numpy as np
+import netCDF4
+from datetime import datetime, timedelta
+import os
+import glob
+from scipy.interpolate import griddata
+from scipy.spatial import KDTree
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import warnings
+warnings.filterwarnings("ignore")
+%matplotlib tk
 
+# A few Constants
+re = 6.378e6  # Earth radius in meters
+daysec = 24 * 60 * 60  # seconds per day
+
+# Define radar sites and fire name, directories.
+radarsite1 = input('Enter Primary Radar Site Identifier as a string (e.g., KHNX ):')
+radarsite2 = input('Enter Secondary Radar Site Identifier as a string (e.g., KDAX ):')
+basedir = 'C:/Users/zacha/pyrocb'
+fire_name = 'DEER_CREEK_FIRE'
+
+# Get user input for date
+while True:
+    try:
+        userInput = input('Enter a date as an 8-digit number (YYYYMMDD): ')
+        userDate = datetime.strptime(userInput, '%Y%m%d')
+        print(f'You entered: {userDate.strftime("%Y-%m-%d")}')
+        break
+    except ValueError:
+        print('Invalid input. Please enter an 8-digit number in the format YYYYMMDD.')
+
+# Start by listing the primary radar files
+sizeThreshold = 10 * 1024 * 1024  # 10 MB
+fileList = glob.glob(os.path.join(basedir, radarsite1, f'{radarsite1}*.nc'))
+largeFiles = [f for f in fileList if os.path.getsize(f) > sizeThreshold]
+files = largeFiles
+
+print(f"Found {len(files)} primary radar files in {os.path.join(basedir, radarsite1)}")
+if not files:
+    print("No primary radar files found or files are smaller than 10 MB. Please check your directory and file sizes.")
+
+# Compile a list of primary times
+PRIMARYtimes = []
+for f in files:
+    basename = os.path.basename(f)
+    # KHNX_20200905_215346.nc
+    dt_str = basename.split('_')[1] + basename.split('_')[2].split('.')[0]
+    PRIMARYtimes.append(datetime.strptime(dt_str, '%Y%m%d%H%M%S'))
+
+# Now extract some of the primary metadata
+fname = files[0]
+with netCDF4.Dataset(fname) as nc:
+    StationLatitude = nc.StationLatitude
+    StationLongitude = nc.StationLongitude
+    StationElevationInMeters = nc.StationElevationInMeters
+
+scalefactor = (re * np.cos(np.deg2rad(StationLatitude))) * (np.pi / 180)
+latfactor = 111180  # meters per deg Latitude
+
+f1 = glob.glob(os.path.join(basedir, radarsite2, f'{radarsite2}*.nc'))
+
+if not f1:
+    print(f"No secondary radar files found in {os.path.join(basedir, radarsite2)}")
+    StationLatitude2 = StationLongitude2 = StationElevationInMeters2 = None
+    xoff = yoff = None
+    SECONDARYflag = -1
+else:
+    SECONDARYtimes = []
+    for f in f1:
+        basename = os.path.basename(f)
+        dt_str = basename.split('_')[1] + basename.split('_')[2].split('.')[0]
+        SECONDARYtimes.append(datetime.strptime(dt_str, '%Y%m%d%H%M%S'))
+
+    fname2 = f1[0]
+    with netCDF4.Dataset(fname2) as nc:
+        StationLatitude2 = nc.StationLatitude
+        StationLongitude2 = nc.StationLongitude
+        StationElevationInMeters2 = nc.StationElevationInMeters
+
+    # Compute offsets
+    xoff = -(StationLongitude2 - StationLongitude) * scalefactor
+    yoff = (StationLatitude2 - StationLatitude) * 111180
+    SECONDARYflag = -1  # Set to -1 to exclude secondary data
+
+# IDEALTIME DRIVER
+targetday = userDate
+starter = targetday + timedelta(hours=19)
+ender = targetday + timedelta(hours=23)
+tideal = []
+curr_time = starter
+while curr_time <= ender:
+    tideal.append(curr_time)
+    curr_time += timedelta(minutes=5)
+
+fout = f'{fire_name}_RADAR_3D_{targetday.strftime("%Y%m%d")}.mat'
+timemaster = [None] * len(tideal)
+
+print("PRIMARYtimes:", PRIMARYtimes)
+print("tideal:", tideal)
+for ttt in range(len(tideal) - 1):
+    print(f'% done: {100 * ttt / len(tideal)}')
+    PRIMARYidx = [i for i, t in enumerate(PRIMARYtimes) if tideal[ttt] <= t < tideal[ttt+1]]
+    print(f"Time window: {tideal[ttt]} to {tideal[ttt+1]}, PRIMARYidx: {PRIMARYidx}")
+    # ...existing code...
+
+# Select Interpolation Method
+while True:
+    methodInput = input('Enter interpolation method ("IDW" or "Scattered Interp"): ').strip().lower()
+    if methodInput == 'idw':
+        interpFlag = 1
+        break
+    elif methodInput == 'scattered interp':
+        interpFlag = 0
+        break
+    else:
+        print('Invalid input. Please enter either "IDW" or "Scattered Interp".')
+
+print(f'Interpolation flag set to: {interpFlag}')
+
+# Loop over the times and find the radar files, then read and concatenate the data, then interpolate
+aa = 0
+aaa = 0
+dbzmaster = None
+
+for ttt in range(len(tideal) - 1):
+    print(f'% done: {100 * ttt / len(tideal)}')
+    PRIMARYidx = [i for i, t in enumerate(PRIMARYtimes) if tideal[ttt] <= t < tideal[ttt+1]]
+    print(f"Time window: {tideal[ttt]} to {tideal[ttt+1]}, PRIMARYidx: {PRIMARYidx}")
+    allx, ally, allz, alldbz = [], [], [], []
+
+    if PRIMARYidx:
+        for ff in PRIMARYidx:
+            aaa += 1
+            fname = files[ff]
+            timer = PRIMARYtimes[ff]
+
+            with netCDF4.Dataset(fname) as nc:
+                dbZ_HI = nc.variables['Reflectivity_HI'][:]
+                dbZ = nc.variables['Reflectivity'][:]
+                az = nc.variables['azimuthR'][:]
+                elev = nc.variables['elevationR'][:]
+                rdist = nc.variables['distanceR'][:]
+                timeR = nc.variables['timeR'][:]
+                az_HI = nc.variables['azimuthR_HI'][:]
+                elev_HI = nc.variables['elevationR_HI'][:]
+                rdist_HI = nc.variables['distanceR_HI'][:]
+                time_HI = nc.variables['timeR_HI'][:]
+
+            dbZ_HI = (0.5 * dbZ_HI) - 33
+            dbZ = (0.5 * dbZ) - 33
+
+            for ev in range(elev_HI.shape[1]):
+                aa += 1
+                az1 = az_HI[:, ev]
+                sidx = np.argsort(az1)
+                az1 = az1[sidx]
+                dbZnow = dbZ_HI[:, sidx, ev].T
+                dbZnow[dbZnow < -5] = np.nan
+
+                evnow = np.nanmean(elev_HI[:, ev])
+                z = np.sqrt(rdist_HI**2 + re**2 + 2 * rdist_HI * re * np.sin(np.deg2rad(evnow))) - re
+                hdist = re * np.arcsin((rdist_HI * np.cos(np.deg2rad(evnow))) / (re + z))
+                hdstmt, azmt = np.meshgrid(hdist, az1, indexing='ij')
+                _, zdist = np.meshgrid(az1, z)
+                xdist = np.sin(np.deg2rad(azmt)) * hdstmt
+                ydist = np.cos(np.deg2rad(azmt)) * hdstmt
+
+                if aa == 1:
+                    fig = plt.figure(22)
+                    ax = fig.add_subplot(111)
+                    dbzc[dbzc < 5] = np.nan
+                    yc = ydist.copy()
+                    if dbzc.shape == xdist.shape:
+                        xc = xdist.copy()
+                        xc[np.isnan(dbzc)] = np.nan
+                        yc = ydist.copy()
+                        yc[np.isnan(dbzc)] = np.nan
+                    else:
+                        print(f"Shape mismatch: dbzc {dbzc.shape}, xdist {xdist.shape}")
+                    xc_flat = xc.flatten()
+                    yc_flat = yc.flatten()
+                    dbzc_flat = dbzc.flatten()
+                    valid_mask = ~np.isnan(xc_flat) & ~np.isnan(yc_flat) & ~np.isnan(dbzc_flat)
+                    xc_valid = xc_flat[valid_mask]
+                    yc_valid = yc_flat[valid_mask]
+                    dbzc_valid = dbzc_flat[valid_mask]
+                    ax.scatter(xc, yc, c=dbzc, cmap='viridis')
+                    plt.show()
+                    print("Please click on the plot to define the bounding box.")
+                    xer, yer = plt.ginput(4)
+                    plt.close(fig)
+
+                    xvec = np.arange(min(xer), max(xer), 300)
+                    yvec = np.arange(min(yer), max(yer), 300)
+                    zvec = np.arange(0, 13001, 500)
+                    xbox = [min(xvec), max(xvec), max(xvec), min(xvec), min(xvec)]
+                    ybox = [min(yvec), min(yvec), max(yvec), max(yvec), min(yvec)]
+                    xxx, yyy, zzz = np.meshgrid(xvec, yvec, zvec)
+                    dbzmaster = np.full((len(tideal), xxx.shape[0], xxx.shape[1], xxx.shape[2]), np.nan)
+
+                inner = (xdist > min(xbox)) & (xdist < max(xbox)) & (ydist > min(ybox)) & (ydist < max(ybox))
+                allx.extend(xdist[inner])
+                ally.extend(ydist[inner])
+                allz.extend(zdist[inner] + StationElevationInMeters)
+                alldbz.extend(dbZnow[inner])
+# 
+    # Optionally reshape or skip this iteration
+            for ev in range(elev.shape[1]):
+                aa += 1
+                az1 = az[:, ev]
+                sidx = np.argsort(az1)
+                az1 = az1[sidx]
+                dbZnow = dbZ[:, sidx, ev]
+                dbZnow[dbZnow < -5] = np.nan
+
+                evnow = np.nanmean(elev[:, ev])
+                z = np.sqrt(rdist**2 + re**2 + 2 * rdist * re * np.sin(np.deg2rad(evnow))) - re
+                hdist = re * np.arcsin((rdist * np.cos(np.deg2rad(evnow))) / (re + z))
+                hdstmt, azmt = np.meshgrid(hdist, az1, indexing='ij')
+                _, zdist = np.meshgrid(az1, z)
+                xdist = np.sin(np.deg2rad(azmt)) * hdstmt
+                ydist = np.cos(np.deg2rad(azmt)) * hdstmt
+
+                inner = (xdist > min(xbox)) & (xdist < max(xbox)) & (ydist > min(ybox)) & (ydist < max(ybox))
+                allx.extend(xdist[inner])
+                ally.extend(ydist[inner])
+                allz.extend(zdist[inner] + StationElevationInMeters)
+                alldbz.extend(dbZnow[inner])
+
+        if aaa == 1:
+            fig = plt.figure(10, figsize=(10, 9))
+            ax = fig.add_subplot(111, projection='3d')
+            valid_indices = np.array(alldbz) > 5
+            sc = ax.scatter(np.array(allx)[valid_indices], np.array(ally)[valid_indices], np.array(allz)[valid_indices], c=np.array(alldbz)[valid_indices], cmap='turbo', s=10 + np.array(alldbz)[valid_indices])
+            plt.colorbar(sc, label='dbZe')
+            ax.set_xlabel('E-W Dist [m]')
+            ax.set_ylabel('N-S Dist [m]')
+            ax.set_zlabel('Alt [m]')
+            plt.title(timer.strftime('%Y-%m-%d %H:%M:%S'))
+            plt.show()
+
+        alldbz = np.nan_to_num(alldbz, nan=-30)
+
+        if interpFlag == 1:
+            valid = ~np.isnan(alldbz)
+            points = np.vstack((allx, ally, allz)).T
+            values = np.array(alldbz)
+            grid_pts = np.vstack((xxx.ravel(), yyy.ravel(), zzz.ravel())).T
+
+            h_radius = 2000
+            v_radius = 1500
+            power = 2
+
+            tree = KDTree(points)
+            dist, idx = tree.query(grid_pts, k=10, distance_upper_bound=h_radius)
+
+            Vg_vec = np.full(grid_pts.shape[0], np.nan)
+            for i in range(grid_pts.shape[0]):
+                valid_idx = idx[i][dist[i] < h_radius]
+                if len(valid_idx) > 0:
+                    d = dist[i][dist[i] < h_radius]
+                    v = values[valid_idx]
+                    w = 1 / (d**power)
+                    Vg_vec[i] = np.sum(w * v) / np.sum(w)
+
+            Vg = Vg_vec.reshape(xxx.shape)
+        elif interpFlag == 0:
+            points = np.vstack((allx, ally, allz)).T
+            values = np.array(alldbz)
+            Vg = griddata(points, values, (xxx, yyy, zzz), method='linear')
+
+        dbzmaster[ttt, :, :, :] = Vg
+        timemaster[ttt] = tideal[ttt]
+
+from scipy.io import savemat
+
+# Save the Output
+if dbzmaster is not None:
+    savemat(fout, {
+        'StationLongitude': StationLongitude,
+        'StationElevationInMeters': StationElevationInMeters,
+        'StationLatitude': StationLatitude,
+        'dbzmaster': dbzmaster,
+        'timemaster': timemaster,
+        'xxx': xxx,
+        'yyy': yyy,
+        'zzz': zzz
+    }, do_compression=True)
+
+from skimage import measure
+from scipy.ndimage import gaussian_filter
+
+# Visualize dbzsurfaces
+if dbzmaster is not None:
+    xxxl = (xxx / scalefactor) + StationLongitude
+    yyyl = (yyy / 111180) + StationLatitude
+    dbzvol = dbzmaster.flatten()
+
+    fig = plt.figure(9)
+    plt.hist(dbzvol[dbzvol > -10], bins=12)
+    plt.show()
+
+    pct = np.nanpercentile(dbzvol[dbzvol > -10], [5, 25, 50, 75, 90, 97, 98, 99])
+    dbzlist = np.round(pct)
+
+    for ff in range(len(tideal) -1):
+        dbzvol_slice = np.squeeze(dbzmaster[ff, :, :, :])
+        dbzvol_slice[np.isnan(dbzvol_slice)] = -60
+
+        if np.nanmax(dbzvol_slice) > -10:
+            fig = plt.figure(50, figsize=(10, 9))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.set_xlim(np.min(xxx), np.max(xxx))
+            ax.set_ylim(np.min(yyy), np.max(yyy))
+
+            clrs = [[1, 1, 1], [0.7, 0.7, 0.7], [1, 0.7, 0.3], [1, 0.7, 0.3], [1, 0, 0], [0.9, 0, 0], [0.8, 0, 0], [0.7, 0, 0], [0.6, 0, 0]]
+            trans = [0.2, 0.1, 0.1, 0.2, 0.2, 0.4, 0.4, 0.5, 0.9]
+
+            for dbs in range(len(dbzlist)):
+                if dbzlist[dbs] < 5:
+                    smoothed_vol = gaussian_filter(dbzvol_slice, sigma=1)
+                else:
+                    smoothed_vol = gaussian_filter(dbzvol_slice, sigma=0.5)
+                verts, faces, _, _ = measure.marching_cubes(smoothed_vol, dbzlist[dbs])
+                x_verts = verts[:, 0] * 300 + np.min(xvec)
+                y_verts = verts[:, 1] * 300 + np.min(yvec)
+                z_verts = verts[:, 2] * 500 + np.min(zvec)
+                ax.plot_trisurf(x_verts, y_verts, faces, z_verts, color=clrs[dbs], alpha=trans[dbs])
+
+            ax.set_zlim(1800, 13000)
+            ax.set_xlabel('E-W Dist [m]')
+            ax.set_ylabel('N-S Dist [m]')
+            ax.set_zlabel('Alt [m]')
+            ax.set_title(tideal[ff].strftime('%Y-%m-%d %H:%M:%S'))
+            plt.show()
